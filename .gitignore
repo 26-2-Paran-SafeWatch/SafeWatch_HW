@@ -1,0 +1,18 @@
+# SafeWatch 라즈베리파이 전송 코드 (SafeWatch_HW)
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 장치가 전송 못 하고 쌓아둔 이벤트를 파일로 저장하게 되면 여기 남는다.
+# 실제 감지 기록이므로 올리지 않는다.
+pending/
+*.queue
+
+# OS · 에디터
+.DS_Store
+.idea/
+.vscode/
+*.swp
