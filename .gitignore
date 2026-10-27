@@ -16,3 +16,71 @@ pending/
 .idea/
 .vscode/
 *.swp
+
+# 엣지 파이프라인
+/data/
+*.mp4
+*.avi
+*.h264
+*.jsonl
+*.jsonl.gz
+*.db
+*.pt
+*.onnx
+*_ncnn_model/
+__pycache__/
+yolo-env/
+runs/
+install_*.sh
+EOFcd ~/SafeWatch_HW
+git switch -c feature/ksh-edge-pipeline
+
+# 구조 생성
+mkdir -p edge/{capture,inference,judge,storage,upload} scripts
+touch edge/__init__.py
+for d in capture inference judge storage upload; do touch edge/$d/__init__.py; done
+
+# 코드 복사
+cp ~/safewatch/edge/schema.py            edge/
+cp ~/safewatch/edge/judge/rules.py       edge/judge/
+cp ~/safewatch/edge/storage/ring.py      edge/storage/
+cp ~/safewatch/edge/upload/queue.py      edge/upload/
+cp ~/safewatch/edge/upload/sender.py     edge/upload/
+cp ~/safewatch/scripts/extract_tracks.py scripts/
+cp ~/safewatch/scripts/flush_queue.py    scripts/
+cp ~/safewatch/run_pipeline.py           .
+
+# .gitignore 보강
+cat >> .gitignore << 'EOF'
+
+# 엣지 파이프라인
+/data/
+*.mp4
+*.avi
+*.h264
+*.jsonl
+*.jsonl.gz
+*.db
+*.pt
+*.onnx
+*_ncnn_model/
+__pycache__/
+yolo-env/
+runs/
+install_*.sh
+
+# 엣지 파이프라인
+/data/
+*.mp4
+*.avi
+*.h264
+*.jsonl
+*.jsonl.gz
+*.db
+*.pt
+*.onnx
+*_ncnn_model/
+__pycache__/
+yolo-env/
+runs/
+install_*.sh
