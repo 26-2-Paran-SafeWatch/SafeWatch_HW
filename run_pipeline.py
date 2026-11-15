@@ -1,121 +1,78 @@
-"""카메라 → 추론 → 추적 → 판단 → 클립 저장 → 큐 적재.
+"""엣지 실행기: AI 파이프라인을 돌리고, 나온 이벤트를 HW 가 받아 클립·큐까지 처리한다.
 
-서버 전송만 비어 있는 상태의 전 구간 관통 파이프라인.
-    python run_pipeline.py
+    AI (SafeWatch_AI src.main.run)      검출 → 추적 → 차선 → 판단 → envelope
+      └─ event_sink = EdgeEventSink      큐 적재 → 클립 → 서버 JSON 저장   (이 저장소)
+    전송은 따로:  python scripts/flush_queue.py --watch 30
+
+사용법 (Pi, yolo-env)
+    cd ~/SafeWatch_HW
+    python run_pipeline.py --source ~/models/sim_weave/sim_weave_a40.mp4
+    python run_pipeline.py --config configs/pi5_ufld_hailo.yaml --source <영상> --data ~/edge_test
+
+    --config 는 AI 저장소 기준 경로. 결과는 <data>/queue.db, <data>/events/<event_id>/
+    카메라 입력(--source camera)은 카메라 공유(링버퍼 + AI 프레임) 구현 전이라 아직 안 된다.
 """
 from __future__ import annotations
 
-import json
-import signal
+import argparse
+import os
 import sys
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 
-import cv2
-from picamera2 import Picamera2
-from ultralytics import YOLO
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from edge.schema import VEHICLE_CLASSES, make_track, make_trackframe
-from edge.judge.rules import SimpleJudge
-from edge.storage.ring import RingBuffer
-from edge.upload.queue import UploadQueue
-
-MODEL   = str(Path.home() / "models/n320/yolo11n_ncnn_model")
-IMGSZ   = 320
-FPS     = 30
-EVENTS  = Path("/data/events")
-CLASSES = list(VEHICLE_CLASSES) + [0]      # 차량 + 사람(실내 시연용)
-
-running = True
-
-
-def _stop(*_):
-    global running
-    running = False
-
-
-signal.signal(signal.SIGINT, _stop)
-signal.signal(signal.SIGTERM, _stop)
+from edge.sink import EdgeEventSink          # noqa: E402
+from edge.storage.ring import probe_clip     # noqa: E402
+from edge.upload.queue import EventQueue     # noqa: E402
 
 
 def main():
-    model = YOLO(MODEL)
-    picam = Picamera2()
-    picam.configure(picam.create_video_configuration(
-        main={"size": (1280, 720), "format": "RGB888"},
-        lores={"size": (640, 384), "format": "YUV420"},
-        raw={"size": (2304, 1296)},
-        buffer_count=4,
-        controls={"FrameRate": FPS, "AfMode": 0, "LensPosition": 0.0},
-    ))
-    picam.start()
-    time.sleep(1)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--source", required=True, help="영상 파일 경로 (camera 는 아직 미지원)")
+    p.add_argument("--config", default="configs/pi5_ufld_hailo.yaml", help="AI 저장소 기준 config")
+    p.add_argument("--ai-dir", default=str(Path.home() / "SafeWatch_AI"))
+    p.add_argument("--data", default="/data", help="큐 DB·이벤트 폴더를 둘 곳")
+    p.add_argument("--pre", type=float, default=10.0, help="이벤트 앞 클립 길이(초)")
+    p.add_argument("--post", type=float, default=5.0, help="이벤트 뒤 클립 길이(초)")
+    args = p.parse_args()
 
-    ring = RingBuffer(picam, fps=FPS, pre_s=10, post_s=5)
-    ring.start()
-    judge = SimpleJudge(fps=FPS)
-    queue = UploadQueue()
+    if args.source == "camera":
+        sys.exit("카메라 입력은 아직 안 된다: 카메라를 링버퍼와 AI 가 같이 쓰는 부분(README 남은 일) 구현 후 사용")
+    source = str(Path(args.source).expanduser().resolve())
+    if not Path(source).exists():
+        sys.exit(f"영상이 없다: {source}")
+    ai_dir = Path(args.ai_dir).expanduser().resolve()
+    if not (ai_dir / "src" / "main.py").exists():
+        sys.exit(f"AI 저장소가 없다: {ai_dir}")
+    data = Path(args.data).expanduser().resolve()
+    events_dir = data / "events"
 
-    ages = {}
-    n = 0
-    t_log = time.time()
-    print("파이프라인 시작. Ctrl+C로 종료", flush=True)
+    q = EventQueue(data / "queue.db")
+    n = q.recover(events_dir=events_dir, probe=probe_clip)
+    if n:
+        print(f"[QUEUE] 지난 실행에서 클립 waiting 으로 남은 {n}건 정리")
+    sink = EdgeEventSink(q, events_dir, pre_s=args.pre, post_s=args.post,
+                         log=lambda m: print(m, flush=True))
 
-    while running:
-        req = picam.capture_request()
-        lo = req.make_array("lores")
-        req.release()
-        frame = cv2.cvtColor(lo, cv2.COLOR_YUV2BGR_I420)
+    # AI 저장소의 config 안 상대 경로(data/models/...)가 AI 저장소 기준이라 그 폴더에서 돈다
+    os.chdir(ai_dir)
+    sys.path.insert(0, str(ai_dir))
+    from src.main import run   # noqa: E402
 
-        res = model.track(frame, imgsz=IMGSZ, persist=True,
-                          tracker="bytetrack.yaml", classes=CLASSES,
-                          verbose=False)[0]
-
-        tracks, seen = [], set()
-        sx = 1280 / frame.shape[1]
-        sy = 720 / frame.shape[0]
-        if res.boxes is not None and res.boxes.id is not None:
-            for b in res.boxes:
-                tid = int(b.id)
-                seen.add(tid)
-                ages[tid] = ages.get(tid, 0) + 1
-                x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
-                tracks.append(make_track(
-                    tid=tid, cls=res.names[int(b.cls)], conf=float(b.conf),
-                    box=[x1 * sx, y1 * sy, x2 * sx, y2 * sy], age=ages[tid]))
-        for tid in [k for k in ages if k not in seen]:
-            ages.pop(tid)
-
-        tf = make_trackframe(time.time(), n, 1280, 720, FPS, tracks)
-        ev = judge.push(tf)
-
-        if ev:
-            stamp = datetime.fromtimestamp(
-                ev["created_at"], timezone.utc).strftime("%Y%m%dT%H%M%S")
-            out_dir = EVENTS / f"{stamp}_{ev['event_id'][:8]}"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / "event.json").write_text(
-                json.dumps(ev, ensure_ascii=False, indent=2))
-            queue.enqueue(ev)
-            codes = ",".join(r["code"] for r in ev["reasons"])
-            print(f"[EVENT] score={ev['score']} {codes} "
-                  f"track={ev['target']['track_id']}", flush=True)
-            ring.save(out_dir, on_done=lambda p, eid=ev["event_id"]: (
-                queue.attach_clip(eid, p),
-                print(f"[CLIP ] {p}", flush=True)))
-
-        n += 1
-        if time.time() - t_log >= 5:
-            print(f"  {n / (time.time() - t_log):5.1f} FPS  "
-                  f"tracks={len(tracks)}  queue={queue.count()}", flush=True)
-            n, t_log = 0, time.time()
-
-    print("\n종료 중...", flush=True)
-    ring.stop()
-    picam.stop()
-    print("큐 상태:", queue.count())
+    print(f"[RUN  ] AI {ai_dir} | config {args.config} | source {source}", flush=True)
+    print(f"[RUN  ] 큐 {data / 'queue.db'} | 이벤트 {events_dir} | 클립 앞 {args.pre:g}초 뒤 {args.post:g}초",
+          flush=True)
+    try:
+        run(config_path=args.config, source=source, event_sink=sink)   # 끝날 때 run 이 sink.close()
+    finally:
+        sink.close()          # 이미 닫혔으면 아무 일도 안 함. 남은 클립 작업을 기다린다
+        s = q.stats()
+        print(f"[DONE ] 이번 실행 이벤트 {sink.published}건 | 큐 전체 {s['total']}건 "
+              f"메타 {s['metadata']} 클립 {s['clip']}", flush=True)
+        print("        자세히: python scripts/flush_queue.py --db "
+              f"{data / 'queue.db'} --status   /   전송: ... --events-dir {events_dir} --watch 30", flush=True)
+        q.close()
 
 
 if __name__ == "__main__":

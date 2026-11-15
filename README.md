@@ -37,13 +37,29 @@ python scripts/flush_queue.py --watch 30        # 30초마다 전송
 python -m unittest tests.test_event_flow -v     # 테스트 (카메라 없이, ffmpeg 필요)
 ```
 
+### 실행 (영상 파일로 전체 테스트)
+
+AI 저장소(`~/SafeWatch_AI`, dev)가 같은 Pi 에 있어야 한다. `run_pipeline.py` 가 AI 의 `src.main.run()` 을
+부르고 `event_sink` 로 `edge/sink.py` 의 `EdgeEventSink` 를 넘긴다.
+
+```bash
+source ~/yolo-env/bin/activate
+cd ~/SafeWatch_HW
+python run_pipeline.py --source ~/models/sim_weave/sim_weave_a40.mp4 --data ~/edge_test
+python scripts/flush_queue.py --db ~/edge_test/queue.db --status
+python scripts/flush_queue.py --db ~/edge_test/queue.db --events-dir ~/edge_test/events   # 서버로 전송
+```
+
+- `--config` 기본값은 AI 의 `configs/pi5_ufld_hailo.yaml` (차선 NPU, 차량 CPU)
+- 이벤트가 나면 `<data>/events/<event_id>/` 에 서버 JSON 과 클립(mp4)이 생긴다
+- 영상 파일 입력은 `trigger.video_sec` 앞 10초·뒤 5초를 원본에서 잘라낸다 (`edge/storage/file_clip.py`)
+- 카메라 입력은 링버퍼가 자른다. 단, 카메라 공유가 아직 없어서 `--source camera` 는 막아 두었다
+
 ### 남은 일
 
-- 카메라 공유: 카메라를 한 번 열어 H.264 는 링버퍼로, RGB 프레임은 AI 로 (`edge/storage/ring.py` 수정)
-- EventSink: AI 가 넘긴 envelope 을 `/data/events/inbox/` 에 저장하고 처리
-- 영상 파일 입력용 클립 자르기 (`trigger.video_sec` 기준 ffmpeg)
+- 카메라 공유: 카메라를 한 번 열어 H.264 는 링버퍼로, RGB 프레임은 AI 의 `frame_source` 로 (`edge/storage/ring.py` 수정)
 - 클립 업로드 (서버 방식 확정 후), 디스크 정리 (`purge_done` 결과로 파일 삭제)
-- `run_pipeline.py` 를 AI `run()` + 위 카메라·sink 를 넣는 실행기로 교체. **지금 파일은 예전 큐를 써서 동작하지 않는다**
+- 서버가 새 이벤트 JSON(event + location + clip)을 받는지 확인 (주민규)
 
 ## 엣지 파이프라인 (2026-10-27)
 
@@ -58,7 +74,7 @@ python -m unittest tests.test_event_flow -v     # 테스트 (카메라 없이, f
 | `edge/judge/rules.py` | 임시 판단 규칙. 대상이 화면 면적 비율 이상으로 N초 지속되면 이벤트 |
 | `edge/upload/queue.py` | SQLite 업로드 큐. 통신 단절에도 이벤트가 사라지지 않게 영속화 |
 | `edge/upload/sender.py` | 서버 전송. reason code → riskType 매핑 포함 |
-| `run_pipeline.py` | 전체 실행기 |
+| `run_pipeline.py` | 전체 실행기 (2026-11-15 교체: AI `run()` + `EdgeEventSink`) |
 | `scripts/flush_queue.py` | 큐를 서버로 비우는 CLI |
 | `scripts/extract_tracks.py` | 영상에서 궤적만 추출(tracks.jsonl). 판단 로직 오프라인 실험용 |
 

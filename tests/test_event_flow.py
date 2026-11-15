@@ -17,7 +17,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from edge.event import TOP_KEYS, assemble, normalize_envelope, validate_envelope
-from edge.recorder import EventRecorder
+from edge.sink import EdgeEventSink
+from edge.storage.file_clip import cut_clip
 from edge.storage.ring import probe_clip
 from edge.upload.queue import BACKOFF_BASE_S, MAX_REJECTS, EventQueue
 from edge.upload.sender import UploadSender
@@ -319,27 +320,85 @@ class TestQueue(Base):
         self.assertEqual(self.q.stats()["total"], 1)
 
 
-class TestRecorder(Base):
-    def recorder(self, ring):
-        return EventRecorder(ring, self.q, self.tmp / "events", log=lambda *_: None)
+class TestFileClip(Base):
+    def test_cut_middle_and_edges(self):
+        src = self.tmp / "src.mp4"
+        make_mp4(src, seconds=30, size="640x360")
+        info = cut_clip(src, 15.0, self.tmp / "a.mp4", pre_s=10, post_s=5)
+        self.assertEqual((info["duration_sec"], info["resolution"]), (15, "640x360"))
+        self.assertEqual(cut_clip(src, 3.0, self.tmp / "b.mp4")["duration_sec"], 8)    # 앞이 잘림
+        self.assertEqual(cut_clip(src, 28.0, self.tmp / "c.mp4")["duration_sec"], 12)  # 뒤가 잘림
+        self.assertFalse(list(self.tmp.glob("*.part.mp4")))
 
-    def test_record_fills_clip_and_writes_json(self):
-        eid = self.recorder(FakeRing(seconds=3)).record(envelope())
+    def test_missing_source(self):
+        with self.assertRaises(FileNotFoundError):
+            cut_clip(self.tmp / "none.mp4", 5.0, self.tmp / "x.mp4")
+
+
+class TestSink(Base):
+    def sink(self, **kw):
+        logs = []
+        s = EdgeEventSink(self.q, self.tmp / "events", log=logs.append, **kw)
+        s.logs = logs
+        return s
+
+    def test_file_source_cuts_clip(self):
+        src = self.tmp / "sim.mp4"
+        make_mp4(src, seconds=30, size="640x360")
+        sink = self.sink()
+        eid = "evt_20261115_143022_001"
+        sink.publish(envelope(eid, source=str(src), video_sec=22.1))
+        sink.close()
         d = self.q.get(eid)
         self.assertEqual(d["clip_status"], "ready")
-        self.assertEqual(d["clip"]["duration_sec"], 3)
+        self.assertEqual(d["clip"]["duration_sec"], 15)
+        self.assertTrue(Path(d["clip_path"]).exists())
         on_disk = json.loads((self.tmp / "events" / eid / f"{eid}.json").read_text(encoding="utf-8"))
         self.assertEqual(on_disk, self.q.server_event(eid))
-        self.assertEqual(list(on_disk), list(TOP_KEYS))
+        self.assertEqual(on_disk["clip"]["filename"], f"{eid}.mp4")
+        self.assertEqual(len(self.q.pending("metadata")), 1)
 
-    def test_ring_busy_or_failure_sends_without_clip(self):
-        for ring, eid in ((FakeRing(busy=True), "evt_20261115_143022_001"),
-                          (FakeRing(fail=True), "evt_20261115_143023_001")):
-            self.recorder(ring).record(envelope(eid))
+    def test_publish_returns_before_clip(self):
+        gate = threading.Event()
+
+        def slow(*a, **k):
+            gate.wait(5)
+            raise RuntimeError("x")
+
+        sink = self.sink(clipper=slow)
+        eid = "evt_20261115_143022_001"
+        sink.publish(envelope(eid, source="/x.mp4", video_sec=5.0))
+        self.assertEqual(self.q.get(eid)["clip_status"], "waiting")   # 바로 돌아옴
+        gate.set()
+        sink.close()
+        self.assertEqual(self.q.get(eid)["clip_status"], "missing")
+
+    def test_camera_with_ring(self):
+        sink = self.sink(ring=FakeRing(seconds=3))
+        eid = sink.publish(envelope()) or "evt_20261115_143022_001"
+        sink.close()
+        self.assertEqual(self.q.get(eid)["clip"]["duration_sec"], 3)
+
+    def test_camera_ring_busy_or_failed_or_absent(self):
+        cases = ((dict(ring=FakeRing(busy=True)), "evt_20261115_143022_001"),
+                 (dict(ring=FakeRing(fail=True)), "evt_20261115_143023_001"),
+                 ({}, "evt_20261115_143024_001"))
+        for kw, eid in cases:
+            sink = self.sink(**kw)
+            sink.publish(envelope(eid))
+            sink.close()
             self.assertEqual(self.q.get(eid)["clip_status"], "missing")
             self.assertIsNone(self.q.server_event(eid)["clip"])
 
-    def test_duplicate_not_recorded_twice(self):
+    def test_bad_envelope_does_not_raise(self):
+        sink = self.sink()
+        sink.publish({"event": {"event_id": "nope"}})
+        sink.publish("garbage")
+        sink.close()
+        self.assertEqual(self.q.stats()["total"], 0)
+        self.assertEqual(len(sink.logs), 2)
+
+    def test_duplicate_once(self):
         calls = []
 
         class CountRing(FakeRing):
@@ -347,10 +406,16 @@ class TestRecorder(Base):
                 calls.append(1)
                 return super().save(*a, **k)
 
-        rec = self.recorder(CountRing())
-        rec.record(envelope())
-        rec.record(copy.deepcopy(envelope()))
-        self.assertEqual(len(calls), 1)
+        sink = self.sink(ring=CountRing())
+        sink.publish(envelope())
+        sink.publish(copy.deepcopy(envelope()))
+        sink.close()
+        self.assertEqual((len(calls), sink.published), (1, 1))
+
+    def test_close_twice_ok(self):
+        sink = self.sink()
+        sink.close()
+        sink.close()
 
 
 class TestSender(Base):
