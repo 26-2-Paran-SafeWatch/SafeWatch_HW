@@ -1,4 +1,50 @@
 
+## 역할 나누기 (2026-11-15)
+
+AI(`SafeWatch_AI`)는 판단해서 이벤트를 만드는 데까지, HW(이 저장소)는 영상 클립·큐·서버 전송을 맡는다.
+
+```
+AI  검출 → 추적 → 차선 → 판단 ──envelope──▶ HW  큐 적재 → 클립 저장 → 서버 JSON 조립 → 전송
+```
+
+AI 가 넘기는 형식(envelope)과 서버로 보내는 형식은 `edge/event.py` 맨 위에 적어 두었다.
+
+- `event` : 서버로 그대로 나가는 부분. AI 책임, HW 는 값을 고치지 않는다
+- `trigger` : 클립 자를 기준 (판정 프레임 시각, 카메라/영상 파일)
+- `target` : 대상 차량 박스 등 참고 정보. 서버로 안 나감
+- 서버 JSON = `event` + `location`(GPS 미장착이라 null) + `clip`
+
+### 이벤트 큐 (`edge/upload/queue.py`)
+
+메타데이터(JSON)와 클립(영상) 상태를 따로 관리한다.
+
+| 상태 | 흐름 |
+| --- | --- |
+| metadata | `pending` → `sent`, 4xx 가 5번이면 `failed` |
+| clip | `waiting` → `ready` → `sent` / 저장 실패·시간 초과면 `missing` / 요청 안 하면 `none` |
+
+- 메타데이터는 클립 저장을 기다렸다가 clip 정보(길이·해상도)를 채워서 보낸다. 클립이 `missing` 이면 `clip: null` 로 보낸다
+- 클립 파일은 메타데이터가 서버에 등록된 뒤에 보낸다. **업로드 방식이 서버와 아직 안 정해져서** 지금은 `ready` 로 대기한다 (`UploadSender(clip_uploader=...)` 자리)
+- 실패하면 다음 시도를 10초, 20초, 40초 … 최대 5분 뒤로 미룬다. 실패한 건이 큐 맨 앞을 막지 않는다
+- 5xx·네트워크 오류는 거절 횟수에 넣지 않는다 (서버가 살아나면 다시 보냄)
+- 같은 `event_id` 는 한 번만 들어간다
+- 예전 형식 `/data/queue.db` 를 열면 기존 테이블을 `events_legacy_<시각>` 으로 옮겨 두고 새로 만든다 (지우지 않음)
+
+```bash
+python scripts/flush_queue.py --status          # 상태별 건수
+python scripts/flush_queue.py --show <event_id> # 한 건 자세히 + 서버로 나갈 JSON
+python scripts/flush_queue.py --watch 30        # 30초마다 전송
+python -m unittest tests.test_event_flow -v     # 테스트 (카메라 없이, ffmpeg 필요)
+```
+
+### 남은 일
+
+- 카메라 공유: 카메라를 한 번 열어 H.264 는 링버퍼로, RGB 프레임은 AI 로 (`edge/storage/ring.py` 수정)
+- EventSink: AI 가 넘긴 envelope 을 `/data/events/inbox/` 에 저장하고 처리
+- 영상 파일 입력용 클립 자르기 (`trigger.video_sec` 기준 ffmpeg)
+- 클립 업로드 (서버 방식 확정 후), 디스크 정리 (`purge_done` 결과로 파일 삭제)
+- `run_pipeline.py` 를 AI `run()` + 위 카메라·sink 를 넣는 실행기로 교체. **지금 파일은 예전 큐를 써서 동작하지 않는다**
+
 ## 엣지 파이프라인 (2026-10-27)
 
 카메라 입력부터 서버 등록까지 전 구간이 동작한다. 판단 로직은 아직 임시 규칙이다.
