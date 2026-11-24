@@ -93,8 +93,8 @@ python scripts/flush_queue.py --watch 30
 환경변수로 대상 서버와 장치를 바꾼다.
 
 ```bash
-export SAFEWATCH_SERVER=http://3.34.130.6:8080
-export SAFEWATCH_DEVICE_ID=aaaaaaaa-0000-0000-0000-000000000001
+export SAFEWATCH_SERVER=https://safewatch.co.kr
+export SAFEWATCH_DEVICE_ID=safewatch-dev-001
 ```
 
 ### 검증된 것 (2026-10-27)

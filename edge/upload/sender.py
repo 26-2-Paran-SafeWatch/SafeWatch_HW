@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
-SERVER_URL = os.environ.get("SAFEWATCH_SERVER", "http://3.34.130.6:8080")
+SERVER_URL = os.environ.get("SAFEWATCH_SERVER", "https://safewatch.co.kr")
 
 # clip_uploader(event_id, clip_path, server_event) — 실패하면 urllib.error.HTTPError /
 # URLError / OSError 를 그대로 던진다 (POST 와 같은 규칙으로 처리).
