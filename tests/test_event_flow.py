@@ -21,7 +21,7 @@ from edge.sink import EdgeEventSink
 from edge.storage.file_clip import cut_clip
 from edge.storage.ring import probe_clip
 from edge.upload.queue import BACKOFF_BASE_S, MAX_REJECTS, EventQueue
-from edge.upload.sender import UploadSender
+from edge.upload.sender import UploadSender, make_clip_uploader
 
 # 서버 스키마 예시 (주민규 님 제공)
 SERVER_EXAMPLE = {
@@ -97,9 +97,10 @@ class FakeRing:
 
 
 class Server:
-    """POST /api/events 받는 가짜 서버."""
+    """POST /api/events · PUT /api/events/clip 받는 가짜 서버."""
     def __init__(self, status=200):
         self.received, self.status = [], status
+        self.clips, self.clip_status = [], 200
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -109,6 +110,12 @@ class Server:
                 self.send_response(outer.status)
                 self.end_headers()
                 self.wfile.write(b'{"status":"new"}')
+
+            def do_PUT(self):
+                n = int(self.headers["Content-Length"])
+                outer.clips.append((self.path, self.headers["Content-Type"], self.rfile.read(n)))
+                self.send_response(outer.clip_status)
+                self.end_headers()
 
             def log_message(self, *a):
                 pass
@@ -427,9 +434,9 @@ class TestSender(Base):
         self.srv.close()
         super().tearDown()
 
-    def sender(self, url=None, uploader=None):
+    def sender(self, url=None, uploader=None, device_id=None):
         return UploadSender(self.q, server_url=url or self.srv.url, clip_uploader=uploader,
-                            log=lambda *_: None)
+                            device_id=device_id, log=lambda *_: None)
 
     def test_sends_assembled_json(self):
         eid = "evt_20261115_143022_001"
@@ -502,6 +509,38 @@ class TestSender(Base):
         r = self.sender(uploader=broken).flush()
         self.assertEqual((r["metadata_ok"], r["clip_fail"]), (1, 1))
         self.assertEqual(self.q.get(eid)["clip_status"], "ready")
+
+
+    def test_make_clip_uploader_puts_mp4(self):
+        eid = "evt_20261115_143022_001"
+        self.q.enqueue(envelope())
+        self.q.attach_clip(eid, self.clip_info(eid))
+        r = self.sender(uploader=make_clip_uploader(self.srv.url)).flush()
+        self.assertEqual((r["metadata_ok"], r["clip_ok"]), (1, 1))
+        path, ctype, body = self.srv.clips[0]
+        self.assertEqual(path, f"/api/events/clip?device_id=safewatch-dev-001&event_id={eid}")
+        self.assertEqual(ctype, "video/mp4")
+        self.assertEqual(body, (self.tmp / "events" / eid / f"{eid}.mp4").read_bytes())
+        self.assertEqual(self.q.get(eid)["clip_status"], "sent")
+
+    def test_clip_410_counts_as_reject(self):
+        eid = "evt_20261115_143022_001"
+        self.q.enqueue(envelope())
+        self.q.attach_clip(eid, self.clip_info(eid))
+        self.srv.clip_status = 410
+        r = self.sender(uploader=make_clip_uploader(self.srv.url)).flush()
+        self.assertEqual((r["metadata_ok"], r["clip_fail"]), (1, 1))
+        d = self.q.get(eid)
+        self.assertEqual((d["clip_status"], d["clip_rejects"]), ("ready", 1))
+
+    def test_device_id_override(self):
+        eid = "evt_20261115_143022_001"
+        self.q.enqueue(envelope())
+        self.q.attach_clip(eid, self.clip_info(eid))
+        self.sender(uploader=make_clip_uploader(self.srv.url), device_id="safewatch-dev-009").flush()
+        self.assertEqual(self.srv.received[0][1]["device_id"], "safewatch-dev-009")
+        self.assertIn("device_id=safewatch-dev-009", self.srv.clips[0][0])
+        self.assertEqual(self.q.server_event(eid)["device_id"], "safewatch-dev-001")   # 큐는 그대로
 
 
 if __name__ == "__main__":

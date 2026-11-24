@@ -24,7 +24,8 @@ AI 가 넘기는 형식(envelope)과 서버로 보내는 형식은 `edge/event.p
 | clip | `waiting` → `ready` → `sent` / 저장 실패·시간 초과면 `missing` / 요청 안 하면 `none` |
 
 - 메타데이터는 클립 저장을 기다렸다가 clip 정보(길이·해상도)를 채워서 보낸다. 클립이 `missing` 이면 `clip: null` 로 보낸다
-- 클립 파일은 메타데이터가 서버에 등록된 뒤에 보낸다. **업로드 방식이 서버와 아직 안 정해져서** 지금은 `ready` 로 대기한다 (`UploadSender(clip_uploader=...)` 자리)
+- 클립 파일은 메타데이터가 서버에 등록된 뒤에 `PUT /api/events/clip?device_id=..&event_id=..` 로 보낸다 (본문 = mp4, `make_clip_uploader()`). 서버가 S3 에 저장한다
+- 서버 응답: 200 완료 / 400·404·410·411·413·415 거절(5번이면 `failed`) / 5xx 재시도. `--no-clip` 이면 클립은 `ready` 로 남는다
 - 실패하면 다음 시도를 10초, 20초, 40초 … 최대 5분 뒤로 미룬다. 실패한 건이 큐 맨 앞을 막지 않는다
 - 5xx·네트워크 오류는 거절 횟수에 넣지 않는다 (서버가 살아나면 다시 보냄)
 - 같은 `event_id` 는 한 번만 들어간다
@@ -58,8 +59,8 @@ python scripts/flush_queue.py --db ~/edge_test/queue.db --events-dir ~/edge_test
 ### 남은 일
 
 - 카메라 공유: 카메라를 한 번 열어 H.264 는 링버퍼로, RGB 프레임은 AI 의 `frame_source` 로 (`edge/storage/ring.py` 수정)
-- 클립 업로드 (서버 방식 확정 후), 디스크 정리 (`purge_done` 결과로 파일 삭제)
-- 서버가 새 이벤트 JSON(event + location + clip)을 받는지 확인 (주민규)
+- 디스크 정리 (`purge_done` 결과로 파일 삭제)
+- https://safewatch.co.kr 로 실제 이벤트·클립 전송 확인
 
 ## 엣지 파이프라인 (2026-10-27)
 
@@ -90,11 +91,12 @@ python run_pipeline.py
 python scripts/flush_queue.py --watch 30
 ```
 
-환경변수로 대상 서버와 장치를 바꾼다.
+서버와 장치 이름은 기본값이 있고, 환경변수나 `flush_queue.py --server/--device` 로 바꾼다.
+장치 이름은 서버에 등록된 이름(`devices.code`)이어야 한다. 안 주면 AI 이벤트의 `device_id`(AI 설정 `event.device_id`) 그대로.
 
 ```bash
-export SAFEWATCH_SERVER=https://safewatch.co.kr
-export SAFEWATCH_DEVICE_ID=safewatch-dev-001
+export SAFEWATCH_SERVER=https://safewatch.co.kr   # 기본값
+export SAFEWATCH_DEVICE_ID=safewatch-dev-001      # 보낼 때 이 이름으로
 ```
 
 ### 검증된 것 (2026-10-27)

@@ -1,8 +1,13 @@
 """이벤트 큐 → 서버 전송.
 
 1) 메타데이터: 큐가 조립한 서버 JSON(event + location + clip)을 POST /api/events.
-2) 클립 파일: 메타데이터가 등록된 이벤트만. 서버의 영상 업로드 방식이 아직 정해지지 않아서
-   clip_uploader 를 넘겨야 보낸다. 안 넘기면 클립은 ready 로 남아 기다린다.
+   서버(SafeWatch_BE)가 AI 이벤트 JSON(snake_case, 중첩)을 그대로 받는다. 변환 없음.
+2) 클립 파일: 메타데이터가 등록된 이벤트만, PUT /api/events/clip?device_id=..&event_id=..
+   (본문 = mp4 그대로, Content-Type video/mp4). make_clip_uploader() 를 clip_uploader 로 넘긴다.
+   안 넘기면 클립은 ready 로 남아 기다린다.
+
+장치 이름: 서버에 등록된 이름(devices.code)이어야 한다. 지금은 safewatch-dev-001.
+   AI 설정(event.device_id)이 넣은 값을 쓰고, SAFEWATCH_DEVICE_ID 를 주면 보낼 때 그 값으로 바꾼다.
 
 결과 처리
   - 2xx              : sent
@@ -15,25 +20,61 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
 SERVER_URL = os.environ.get("SAFEWATCH_SERVER", "https://safewatch.co.kr")
+DEVICE_ID = os.environ.get("SAFEWATCH_DEVICE_ID") or None   # None 이면 AI 이벤트의 device_id 그대로
 
 # clip_uploader(event_id, clip_path, server_event) — 실패하면 urllib.error.HTTPError /
 # URLError / OSError 를 그대로 던진다 (POST 와 같은 규칙으로 처리).
 ClipUploader = Callable[[str, Path, dict], None]
 
 
+def make_clip_uploader(server_url: str = SERVER_URL, timeout: float = 120) -> ClipUploader:
+    """서버 영상 업로드(PUT /api/events/clip)를 부르는 clip_uploader 를 만든다.
+
+    서버 응답 (SafeWatch_BE README '영상 클립 업로드')
+        200                         저장됨 / 같은 클립 재전송   → sent
+        400 404 410 411 413 415     등록 안 된 장치, 이벤트 없음, 이미 파기, 크기·형식 문제 → 거절(rejects)
+        5xx · 네트워크              나중에 재시도
+    파일을 메모리에 올리지 않고 그대로 흘려보낸다 (Content-Length 를 직접 넣음). 서버 한도 50MB.
+    """
+    base = server_url.rstrip("/") + "/api/events/clip"
+
+    def upload(event_id: str, clip_path: Path, server_event: dict) -> None:
+        size = clip_path.stat().st_size
+        if size <= 0:
+            raise ValueError(f"빈 클립: {clip_path}")
+        q = urllib.parse.urlencode({"device_id": server_event["device_id"], "event_id": event_id})
+        with open(clip_path, "rb") as f:
+            req = urllib.request.Request(
+                f"{base}?{q}", data=f, method="PUT",
+                headers={"Content-Type": "video/mp4", "Content-Length": str(size)})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                r.read()
+
+    return upload
+
+
 class UploadSender:
     def __init__(self, queue, server_url: str = SERVER_URL, timeout: float = 10,
-                 clip_uploader: Optional[ClipUploader] = None, log=print):
+                 clip_uploader: Optional[ClipUploader] = None, device_id: Optional[str] = DEVICE_ID,
+                 log=print):
         self.queue = queue
         self.url = server_url.rstrip("/") + "/api/events"
         self.timeout = timeout
         self.clip_uploader = clip_uploader
+        self.device_id = device_id
         self.log = log
+
+    def _out(self, payload: dict) -> dict:
+        """보낼 JSON. device_id 를 지정했으면 그 값으로 (큐에 저장된 것은 안 바꾼다)."""
+        if self.device_id and payload.get("device_id") != self.device_id:
+            return {**payload, "device_id": self.device_id}
+        return payload
 
     def _post(self, payload: dict):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -73,7 +114,7 @@ class UploadSender:
         r = {"metadata_ok": 0, "metadata_fail": 0, "clip_ok": 0, "clip_fail": 0,
              "clip_waiting_uploader": 0}
         for item in self.queue.pending("metadata", limit):
-            eid, payload = item["event_id"], item["payload"]
+            eid, payload = item["event_id"], self._out(item["payload"])
 
             def send(payload=payload):
                 status, _ = self._post(payload)
@@ -90,7 +131,7 @@ class UploadSender:
             r["clip_waiting_uploader"] = len(clips)
             return r
         for item in clips:
-            eid, path, payload = item["event_id"], Path(item["clip_path"]), item["payload"]
+            eid, path, payload = item["event_id"], Path(item["clip_path"]), self._out(item["payload"])
 
             def send(eid=eid, path=path, payload=payload):
                 if not path.exists():
